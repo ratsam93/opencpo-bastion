@@ -20,7 +20,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +259,7 @@ class UniFiProvider(CameraProvider):
 
         # Fallback: scan common gateway IPs
         common_hosts = ["192.168.1.1", "10.0.0.1", "192.168.0.1", "172.16.0.1"]
-        async with httpx.AsyncClient(verify=False, timeout=2) as client:
+        async with httpx.AsyncClient(verify=self.config.get("verify_ssl", True), timeout=2) as client:
             for host in common_hosts:
                 for port in (7443, 443):
                     try:
@@ -301,7 +301,8 @@ class UniFiProvider(CameraProvider):
 
         logger.info("Connecting to UniFi Protect at %s:%d ...", host, port)
         self._protect = ProtectApiClient(
-            host, port, username, password, verify_ssl=False
+            host, port, username, password,
+            verify_ssl=bool(self.config.get("verify_ssl", True)),
         )
 
         await self._protect.update()
