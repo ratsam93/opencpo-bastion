@@ -43,36 +43,133 @@ def _device_id() -> str:
         return f"gw-{os.urandom(8).hex()}"
 
 
+VAULT_MAGIC_V2 = b"OCV2"  # blob prefix for secret-mixed key derivation
+
+
+def _vault_secret() -> bytes:
+    """
+    Optional operator secret mixed into key derivation.
+
+    Read from OPENCPO_VAULT_SECRET, or from the file named by
+    OPENCPO_VAULT_SECRET_FILE. Returns b"" when none is configured.
+    """
+    val = os.environ.get("OPENCPO_VAULT_SECRET")
+    if val:
+        return val.encode()
+    path = os.environ.get("OPENCPO_VAULT_SECRET_FILE")
+    if path:
+        try:
+            return Path(path).read_bytes().strip()
+        except OSError as e:
+            logger.error("Cannot read OPENCPO_VAULT_SECRET_FILE %s: %s", path, e)
+    return b""
+
+
+def _legacy_key() -> bytes:
+    """sha256(machine-id + fixed salt). Obfuscation only: machine-id is world-readable."""
+    import hashlib
+    return hashlib.sha256(_device_id().encode() + b"opencpo-keyvault-v1").digest()
+
+
+def _secret_key(secret: bytes) -> bytes:
+    """scrypt over the operator secret, salted with the machine-id."""
+    import hashlib
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    salt = hashlib.sha256(b"opencpo-keyvault-v2" + _device_id().encode()).digest()
+    return Scrypt(salt=salt, length=32, n=2**14, r=8, p=1).derive(secret)
+
+
 def _encryption_key() -> bytes:
     """
-    Derive a device-specific encryption key.
-    Uses machine-id + fixed salt — not exportable without physical access.
+    Derive the device encryption key.
+
+    With OPENCPO_VAULT_SECRET (or _FILE) set, the key is scrypt(secret, salt=f(machine-id)),
+    so reading /etc/machine-id alone is not enough. WITHOUT a secret this falls back to
+    the legacy machine-id-only derivation, which is obfuscation, not protection.
     """
-    import hashlib
-    machine_id = _device_id().encode()
-    salt = b"opencpo-keyvault-v1"
-    return hashlib.sha256(machine_id + salt).digest()
+    secret = _vault_secret()
+    return _secret_key(secret) if secret else _legacy_key()
 
 
 def _encrypt_file(path: Path, data: bytes) -> None:
-    """Simple symmetric encryption for key files at rest."""
+    """Symmetric encryption for key files at rest (atomic write, mode 0600)."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    key = _encryption_key()
+    secret = _vault_secret()
     nonce = os.urandom(12)
-    aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, data, None)
+    if secret:
+        blob = VAULT_MAGIC_V2 + nonce + AESGCM(_secret_key(secret)).encrypt(nonce, data, None)
+    else:
+        logger.warning(
+            "OPENCPO_VAULT_SECRET not set — vault key is derived from machine-id only "
+            "(obfuscation, not protection)"
+        )
+        blob = nonce + AESGCM(_legacy_key()).encrypt(nonce, data, None)
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    path.write_bytes(nonce + ciphertext)
-    path.chmod(0o600)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(blob)
+    os.replace(tmp, path)
 
 
 def _decrypt_file(path: Path) -> bytes:
+    """Decrypt a vault blob: try the secret-mixed format first, then legacy."""
+    from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     raw = path.read_bytes()
-    nonce, ciphertext = raw[:12], raw[12:]
-    key = _encryption_key()
-    aesgcm = AESGCM(key)
-    return aesgcm.decrypt(nonce, ciphertext, None)
+    secret = _vault_secret()
+    if raw.startswith(VAULT_MAGIC_V2):
+        if not secret:
+            raise ValueError("vault blob needs OPENCPO_VAULT_SECRET but none is set")
+        body = raw[len(VAULT_MAGIC_V2):]
+        try:
+            return AESGCM(_secret_key(secret)).decrypt(body[:12], body[12:], None)
+        except InvalidTag:
+            pass  # fall through to legacy (blob could be a legacy one starting with the magic)
+    return AESGCM(_legacy_key()).decrypt(raw[:12], raw[12:], None)
+
+
+def _tmpfs_base() -> Path:
+    for cand in (Path("/run"), Path("/dev/shm")):
+        if cand.is_dir() and os.access(cand, os.W_OK):
+            return cand
+    raise RuntimeError("no writable tmpfs (/run or /dev/shm) for the decrypted key")
+
+
+def decrypt_key_to_tmpfs(key_file: Optional[Path] = None, base_dir: Optional[Path] = None):
+    """
+    Decrypt the vault key to a mode-0600 file inside a private 0700 dir on tmpfs.
+
+    Returns (path, cleanup). Call cleanup() as soon as the consumer has read the
+    key (e.g. right after ssl.SSLContext.load_cert_chain).
+    """
+    import shutil
+    import tempfile
+    key_pem = _decrypt_file(key_file or KEY_FILE)
+    tmpdir = Path(tempfile.mkdtemp(prefix="opencpo-key-", dir=base_dir or _tmpfs_base()))
+    os.chmod(tmpdir, 0o700)
+    path = tmpdir / "key.pem"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key_pem)
+    except BaseException:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+    def cleanup() -> None:
+        try:
+            if path.exists():
+                with open(path, "r+b") as f:
+                    f.write(b"\0" * len(key_pem))
+                    f.flush()
+                    os.fsync(f.fileno())
+                path.unlink()
+        except OSError:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return path, cleanup
 
 
 class TPMKeyStore:
@@ -105,16 +202,23 @@ class TPMKeyStore:
 
     def generate_key(self) -> None:
         import subprocess
+        import tempfile
+        # Primary context lives in a private temp dir that is always removed.
+        with tempfile.TemporaryDirectory(prefix="opencpo-tpm-") as td:
+            self._generate_key_in(Path(td) / "primary.ctx", subprocess)
+
+    def _generate_key_in(self, primary_ctx: Path, subprocess) -> None:
+        primary = str(primary_ctx)
         subprocess.run([
             "tpm2_createprimary", "-C", "o", "-G", "rsa2048",
-            "-c", "/tmp/primary.ctx",
+            "-c", primary,
         ], check=True)
         subprocess.run([
             "tpm2_create", "-G", "rsa2048", "-u", str(CERT_DIR / "tpm_pub.key"),
-            "-r", str(CERT_DIR / "tpm_priv.key"), "-C", "/tmp/primary.ctx",
+            "-r", str(CERT_DIR / "tpm_priv.key"), "-C", primary,
         ], check=True)
         subprocess.run([
-            "tpm2_load", "-C", "/tmp/primary.ctx",
+            "tpm2_load", "-C", primary,
             "-u", str(CERT_DIR / "tpm_pub.key"),
             "-r", str(CERT_DIR / "tpm_priv.key"),
             "-c", str(CERT_DIR / "tpm_handle.ctx"),
@@ -139,6 +243,13 @@ class KeyVault:
         self._tpm = TPMKeyStore()
         self._cert: Optional[x509.Certificate] = None
         self._http: Optional[httpx.AsyncClient] = None
+        self._pending_key_pem: Optional[bytes] = None
+
+    def decrypt_key_to_tmpfs(self):
+        """Decrypt the device key to a private tmpfs file; returns (path, cleanup)."""
+        if self._tpm.available:
+            raise RuntimeError("key is TPM-backed; no software key to export")
+        return decrypt_key_to_tmpfs(KEY_FILE)
 
     async def start(self) -> None:
         CERT_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -176,11 +287,12 @@ class KeyVault:
             # Store via TPM — don't write plaintext key
             self._tpm.generate_key()
         else:
-            _encrypt_file(KEY_FILE, key_pem)
+            # Persisted later by provision(), only after the signed cert is stored.
+            self._pending_key_pem = key_pem
 
         logger.info(
             "Keypair generated (%s)",
-            "TPM-backed" if self._tpm.available else "software-encrypted",
+            "TPM-backed" if self._tpm.available else "software (pending commit)",
         )
         return key
 
@@ -219,8 +331,20 @@ class KeyVault:
             cert_pem = body["cert"].encode()
             ca_pem = body.get("ca", "").encode()
 
-            CERT_FILE.write_bytes(cert_pem)
-            CERT_FILE.chmod(0o644)
+            # Stage the new key (encrypted) next to the old one; swap in only
+            # after the signed cert is stored so a failed signing keeps the old pair.
+            staged_key = None
+            if self._pending_key_pem is not None:
+                staged_key = KEY_FILE.with_name(KEY_FILE.name + ".new")
+                _encrypt_file(staged_key, self._pending_key_pem)
+
+            tmp_cert = CERT_FILE.with_name(CERT_FILE.name + ".tmp")
+            tmp_cert.write_bytes(cert_pem)
+            tmp_cert.chmod(0o644)
+            os.replace(tmp_cert, CERT_FILE)
+            if staged_key is not None:
+                os.replace(staged_key, KEY_FILE)
+                self._pending_key_pem = None
 
             if ca_pem:
                 CA_FILE.write_bytes(ca_pem)
