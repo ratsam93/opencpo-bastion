@@ -87,6 +87,15 @@ class GatewayConfig:
     proxy_ports: ProxyPorts = field(default_factory=ProxyPorts)
     tailscale_hostname: str = ""  # auto-generated if empty
 
+    # Charger-facing listener TLS (mTLS when tls_ca is set)
+    tls_cert: str = ""
+    tls_key: str = ""
+    tls_ca: str = ""
+    # Explicitly allow a non-loopback listener without mTLS (path-only identity)
+    allow_insecure: bool = False
+    # Verify the upstream Core TLS certificate (false only with explicit opt-out)
+    upstream_verify: bool = True
+
     # Logging
     log_level: str = "info"
 
@@ -238,6 +247,12 @@ def load_config() -> GatewayConfig:
             config.discovery_interval_seconds = raw.get(
                 "discovery_interval_seconds", config.discovery_interval_seconds
             )
+
+            config.tls_cert = raw.get("tls_cert", config.tls_cert)
+            config.tls_key = raw.get("tls_key", config.tls_key)
+            config.tls_ca = raw.get("tls_ca", config.tls_ca)
+            config.allow_insecure = bool(raw.get("allow_insecure", config.allow_insecure))
+            config.upstream_verify = bool(raw.get("upstream_verify", config.upstream_verify))
 
             # Proxy ports (nested)
             if "proxy_ports" in raw and isinstance(raw["proxy_ports"], dict):
