@@ -167,12 +167,30 @@ def _derive_vip(interface: str) -> str:
 
 
 def _keepalived_auth_pass(key: str) -> str:
-    """Derive an 8-char keepalived auth pass from the shared key."""
+    """
+    Derive an 8-char keepalived auth pass from the shared key.
+
+    With no shared key a random pass is generated (never a well-known default).
+    Both units must then be given the same ``ha.encryption_key`` for VRRP
+    authentication to match.
+    """
     if not key:
-        return "opencpo0"
+        logger.warning(
+            "ha.encryption_key is empty — generated a random keepalived auth_pass; "
+            "set the same ha.encryption_key on both units so VRRP auth matches"
+        )
+        return secrets.token_hex(4)
     import hashlib
-    h = hashlib.sha256(key.encode()).hexdigest()
+    h = hashlib.sha256(b"opencpo-ha-vrrp-v1" + key.encode()).hexdigest()
     return h[:8]
+
+
+def derive_aes_key(secret) -> bytes:
+    """Derive a 32-byte AES key from the shared HA secret (domain-separated SHA-256)."""
+    import hashlib
+    if isinstance(secret, str):
+        secret = secret.encode()
+    return hashlib.sha256(b"opencpo-ha-replication-v1\x00" + secret).digest()
 
 
 def start_keepalived() -> None:
@@ -601,6 +619,11 @@ class HAManager:
         Active → Standby: send encrypted state snapshot every sync_interval.
         Standby: listen for state from active.
         """
+        try:
+            self._require_crypto()
+        except RuntimeError as e:
+            logger.error("State replication NOT started: %s", e)
+            return
         if self._role == "active":
             await self._replication_sender()
         else:
@@ -750,7 +773,7 @@ class HAManager:
     async def _load_or_generate_key(self) -> None:
         """Load shared encryption key from keyvault, or generate and store it."""
         if self.ha.encryption_key:
-            self._encryption_key = self.ha.encryption_key.encode()[:32].ljust(32, b"0")
+            self._encryption_key = self.ha.encryption_key.encode()
             return
 
         # Try vault
@@ -758,14 +781,14 @@ class HAManager:
             try:
                 key = await self.vault.get_secret("ha_encryption_key")
                 if key:
-                    self._encryption_key = key.encode()[:32].ljust(32, b"0")
+                    self._encryption_key = key.encode()
                     return
             except Exception:
                 pass
 
         # Generate new key
         key = secrets.token_hex(32)
-        self._encryption_key = key.encode()[:32]
+        self._encryption_key = key.encode()
         logger.info("Generated new HA encryption key")
 
         if self.vault:
@@ -774,34 +797,26 @@ class HAManager:
             except Exception as e:
                 logger.warning("Could not store HA key in vault: %s", e)
 
-    def _encrypt(self, data: bytes) -> bytes:
-        """Encrypt state replication payload with AES-GCM."""
+    @staticmethod
+    def _require_crypto() -> None:
         try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            key = self._encryption_key[:32].ljust(32, b"0")
-            nonce = secrets.token_bytes(12)
-            ct = AESGCM(key).encrypt(nonce, data, None)
-            return nonce + ct
-        except ImportError:
-            # cryptography not available — pass through (not ideal, logged)
-            logger.warning("cryptography library not available — state replication unencrypted")
-            return data
-        except Exception as e:
-            logger.error("Encryption error: %s", e)
-            return data
+            import cryptography.hazmat.primitives.ciphers.aead  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "the 'cryptography' package is required for HA state replication"
+            ) from e
+
+    def _encrypt(self, data: bytes) -> bytes:
+        """Encrypt state replication payload with AES-GCM (never falls back to plaintext)."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        nonce = secrets.token_bytes(12)
+        return nonce + AESGCM(derive_aes_key(self._encryption_key)).encrypt(nonce, data, None)
 
     def _decrypt(self, data: bytes) -> bytes:
-        """Decrypt state replication payload."""
-        try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            key = self._encryption_key[:32].ljust(32, b"0")
-            nonce, ct = data[:12], data[12:]
-            return AESGCM(key).decrypt(nonce, ct, None)
-        except ImportError:
-            return data
-        except Exception as e:
-            logger.error("Decryption error: %s", e)
-            return data
+        """Decrypt state replication payload; raises on failure (no plaintext accepted)."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        nonce, ct = data[:12], data[12:]
+        return AESGCM(derive_aes_key(self._encryption_key)).decrypt(nonce, ct, None)
 
     # ── Graceful failover ─────────────────────────────────────────────────────
 

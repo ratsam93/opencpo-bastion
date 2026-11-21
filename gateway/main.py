@@ -180,6 +180,8 @@ async def main() -> None:
         cert_path=vault.cert_path,
         key_path=vault.key_path,
         ca_path=vault.ca_path,
+        vault=vault,
+        bind=proxy_bind,
     )
 
     # ── Charger discovery ─────────────────────────────────────────────────────

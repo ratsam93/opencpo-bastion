@@ -29,6 +29,27 @@ from gateway.cctv import CameraEvent
 
 logger = logging.getLogger(__name__)
 
+_METRICS: Optional[tuple] = None
+
+
+def _get_metrics() -> tuple:
+    """Create the Prometheus metrics once per process (get-or-create)."""
+    global _METRICS
+    if _METRICS is None:
+        try:
+            from prometheus_client import Counter, Histogram
+            _METRICS = (
+                Counter("opencpo_lpr_reads_total", "LPR reads by camera", ["camera_id"]),
+                Histogram(
+                    "opencpo_lpr_confidence",
+                    "LPR confidence scores",
+                    buckets=[0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
+                ),
+            )
+        except ImportError:
+            _METRICS = (None, None)
+    return _METRICS
+
 LPR_BUFFER_SIZE = 10_000
 CACHE_PATH = Path("/var/lib/opencpo/lpr_cache.json")
 
@@ -91,22 +112,8 @@ class LPRProcessor:
         self._http: Optional[httpx.AsyncClient] = None
         self._flush_task: Optional[asyncio.Task] = None
 
-        # Prometheus
-        try:
-            from prometheus_client import Counter, Histogram
-            self._reads_counter = Counter(
-                "opencpo_lpr_reads_total",
-                "LPR reads by camera",
-                ["camera_id"],
-            )
-            self._confidence_hist = Histogram(
-                "opencpo_lpr_confidence",
-                "LPR confidence scores",
-                buckets=[0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
-            )
-        except ImportError:
-            self._reads_counter = None
-            self._confidence_hist = None
+        # Prometheus (module-level, created once)
+        self._reads_counter, self._confidence_hist = _get_metrics()
 
     def _load_cache(self) -> None:
         if CACHE_PATH.exists():
